@@ -1,0 +1,227 @@
+# --- File: hosts.ini ---
+#
+# This is the Ansible inventory file.
+# It defines the groups for the different types of nodes in our cluster.
+# Replace the IP addresses with the actual IP addresses of your servers.
+
+[manager_nodes]
+k8s-manager-1 ansible_host=192.168.1.10
+
+[worker_nodes]
+k8s-worker-1 ansible_host=192.168.1.20
+k8s-worker-2 ansible_host=192.168.1.21
+
+[admin_node]
+k8s-admin-1 ansible_host=192.168.1.30
+
+# The all group ensures that common tasks run on all nodes (managers and workers).
+# We exclude the admin node from these tasks as it's a control machine.
+[all_k8s_nodes:children]
+manager_nodes
+worker_nodes
+
+
+# --- File: site.yml ---
+#
+# This is the main playbook file.
+# It orchestrates the execution of the different roles.
+# The roles are applied in a specific order to ensure proper cluster setup.
+
+- name: Kubernetes Cluster Deployment
+  hosts: all_k8s_nodes
+  become: yes
+  roles:
+    - common
+  tags:
+    - common
+
+- name: Initialize Kubernetes Master
+  hosts: manager_nodes
+  become: yes
+  roles:
+    - manager
+  tags:
+    - manager
+
+- name: Join Worker Nodes to Cluster
+  hosts: worker_nodes
+  become: yes
+  roles:
+    - worker
+  tags:
+    - worker
+
+- name: Setup Admin Node for kubectl and helm
+  hosts: admin_node
+  become: yes
+  roles:
+    - admin
+  tags:
+    - admin
+
+- name: Deploy Container Network Interface (CNI)
+  hosts: manager_nodes
+  become: yes
+  roles:
+    - cni
+  tags:
+    - cni
+
+
+# --- File: group_vars/all.yml ---
+#
+# This file contains common variables used across all roles.
+# It's a good practice to centralize variables here for easy management.
+
+# Kubernetes version to be installed on all nodes
+kube_version: "1.28.0-00"
+
+# User for the cluster administration (this user will own the .kube directory)
+ansible_user: "your_user"
+
+# CNI plugin to install (e.g., Calico or Flannel)
+cni_url: "https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml"
+
+
+# --- File: roles/common/tasks/main.yml ---
+#
+# This role installs the necessary dependencies on all manager and worker nodes.
+
+- name: Disable Swap
+  ansible.builtin.shell: |
+    swapoff -a
+    sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+  args:
+    executable: /bin/bash
+
+- name: Add Kubernetes apt key
+  ansible.builtin.apt_key:
+    url: https://pkgs.k8s.io/core:/stable:/v{{ kube_version | regex_replace('\\.\\d+.*', '') }}/deb/Release.key
+    state: present
+  when: ansible_os_family == 'Debian'
+
+- name: Add Kubernetes apt repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kube_version | regex_replace('\\.\\d+.*', '') }}/deb/ /"
+    state: present
+    filename: kubernetes
+  when: ansible_os_family == 'Debian'
+
+- name: Install required packages (kubelet, kubeadm, kubectl)
+  ansible.builtin.apt:
+    name:
+      - kubelet={{ kube_version }}
+      - kubeadm={{ kube_version }}
+      - kubectl={{ kube_version }}
+      - "containerd.io"
+    state: present
+    update_cache: yes
+    force: yes
+
+- name: Hold the packages to prevent updates
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+- name: Enable and start kubelet service
+  ansible.builtin.systemd:
+    name: kubelet
+    state: started
+    enabled: yes
+
+
+# --- File: roles/manager/tasks/main.yml ---
+#
+# This role is for the manager node(s). It initializes the Kubernetes cluster.
+
+- name: Initialize Kubernetes cluster
+  ansible.builtin.command: kubeadm init --apiserver-advertise-address={{ ansible_host }} --pod-network-cidr=10.244.0.0/16
+  register: kube_init_result
+  args:
+    creates: /etc/kubernetes/admin.conf
+
+- name: Create .kube directory for the user
+  ansible.builtin.file:
+    path: /home/{{ ansible_user }}/.kube
+    state: directory
+    owner: "{{ ansible_user }}"
+    mode: '0755'
+
+- name: Copy kubeconfig to user's home directory
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/{{ ansible_user }}/.kube/config
+    remote_src: yes
+    owner: "{{ ansible_user }}"
+    mode: '0600'
+
+
+# --- File: roles/worker/tasks/main.yml ---
+#
+# This role is for the worker nodes. It joins them to the cluster.
+# It depends on the manager node role completing first to get the join command.
+
+- name: Get join command from manager node
+  ansible.builtin.command: "kubeadm token create --print-join-command"
+  delegate_to: "{{ hostvars[groups['manager_nodes'][0]]['ansible_host'] }}"
+  register: kube_join_command
+  run_once: true
+
+- name: Join the worker node to the cluster
+  ansible.builtin.command: "{{ kube_join_command.stdout }}"
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+
+
+# --- File: roles/admin/tasks/main.yml ---
+#
+# This role sets up the designated admin node with kubectl and helm.
+# It's important to set up kubectl to connect to the new cluster.
+
+- name: Get kubeconfig from manager node
+  ansible.builtin.fetch:
+    src: /etc/kubernetes/admin.conf
+    dest: /tmp/kubeconfig/
+    flat: yes
+  delegate_to: "{{ hostvars[groups['manager_nodes'][0]]['ansible_host'] }}"
+  run_once: true
+
+- name: Create .kube directory for the admin user
+  ansible.builtin.file:
+    path: /home/{{ ansible_user }}/.kube
+    state: directory
+    owner: "{{ ansible_user }}"
+    mode: '0755'
+
+- name: Copy kubeconfig to admin user's home directory
+  ansible.builtin.copy:
+    src: /tmp/kubeconfig/admin.conf
+    dest: /home/{{ ansible_user }}/.kube/config
+    remote_src: no
+    owner: "{{ ansible_user }}"
+    mode: '0600'
+
+- name: Install Helm
+  ansible.builtin.shell: |
+    curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+  args:
+    executable: /bin/bash
+    creates: /usr/local/bin/helm
+
+
+# --- File: roles/cni/tasks/main.yml ---
+#
+# This role deploys a Container Network Interface (CNI) plugin.
+# The cluster will be in a "not ready" state until a CNI is deployed.
+# We're using Calico in this example.
+
+- name: Deploy CNI (Calico)
+  ansible.builtin.command: "kubectl apply -f {{ cni_url }}"
+  delegate_to: "{{ hostvars[groups['manager_nodes'][0]]['ansible_host'] }}"
+  when: inventory_hostname in groups['manager_nodes']
+  args:
+    chdir: /tmp
