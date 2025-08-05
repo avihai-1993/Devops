@@ -1,0 +1,73 @@
+---
+- name: Install Docker on all nodes
+  hosts: managers:workers
+  become: yes
+  tasks:
+    - name: Install required system packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - software-properties-common
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable
+        state: present
+        filename: docker
+
+    - name: Install Docker Engine
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: latest
+        update_cache: yes
+
+    - name: Enable and start Docker
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+- name: Initialize Docker Swarm on manager
+  hosts: managers
+  become: yes
+  tasks:
+    - name: Initialize Docker Swarm (only if not already)
+      shell: |
+        docker swarm init --advertise-addr {{ ansible_default_ipv4.address }}
+      args:
+        creates: /var/lib/docker/swarm  # idempotency
+
+    - name: Get worker join token
+      shell: docker swarm join-token -q worker
+      register: worker_token
+      changed_when: false
+
+    - name: Set fact for worker join token
+      set_fact:
+        swarm_worker_token: "{{ worker_token.stdout }}"
+      delegate_to: localhost  # Store on localhost to pass to worker group
+
+- name: Join workers to the swarm
+  hosts: workers
+  become: yes
+  vars:
+    manager_ip: "{{ hostvars[groups['managers'][0]]['ansible_default_ipv4']['address'] }}"
+  tasks:
+    - name: Join the Docker swarm
+      shell: |
+        docker swarm join --token {{ hostvars[groups['managers'][0]]['swarm_worker_token'] }} {{ manager_ip }}:2377
+      args:
+        creates: /var/lib/docker/swarm  # prevent rejoining
