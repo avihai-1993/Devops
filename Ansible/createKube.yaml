@@ -1,0 +1,259 @@
+---
+# This playbook installs and deploys a Kubernetes cluster using kubeadm.
+# It is designed to be run from a control machine with Ansible installed.
+#
+# Assumptions:
+# - SSH access is configured for all target nodes.
+# - The target nodes are using a Debian-based Linux distribution (e.g., Ubuntu).
+# - The inventory file is correctly configured with 'manager', 'worker', and 'admin' groups.
+# - Root or a user with sudo privileges can be used.
+
+# Define variables for easy configuration
+- hosts: all
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    kubernetes_version: "1.29.0-00" # Specify the Kubernetes version to install
+    pod_network_cidr: "10.244.0.0/16" # CIDR for the pod network (Calico default)
+
+# ==============================================================================
+# --- Play 1: Common Prerequisites for All Nodes (Manager, Worker, Admin) ---
+# ==============================================================================
+# This play ensures all necessary dependencies are installed on all nodes.
+- name: Common prerequisites for all nodes
+  hosts: all
+  become: yes
+  tasks:
+    # Disable swap to meet Kubernetes requirements
+    - name: Disable swap permanently
+      ansible.posix.mount:
+        name: "{{ item }}"
+        fstype: swap
+        state: absent
+      loop:
+        - swap
+        - none
+      ignore_errors: true # Ignore errors if swap is already disabled or not present
+
+    - name: Turn off swap for the current session
+      ansible.builtin.shell: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    # Ensure necessary modules are loaded
+    - name: Load br_netfilter module
+      community.general.modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Load overlay module
+      community.general.modprobe:
+        name: overlay
+        state: present
+
+    # Configure sysctl for Kubernetes networking
+    - name: Add sysctl settings for Kubernetes
+      ansible.builtin.copy:
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        mode: '0644'
+
+    - name: Apply sysctl settings without reboot
+      ansible.builtin.shell: sysctl --system
+
+    # Install Docker as the Container Runtime Interface (CRI)
+    - name: Install Docker dependencies
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker APT repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ ansible_architecture }}] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker Engine
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+
+    - name: Ensure Docker service is running and enabled
+      ansible.builtin.systemd_service:
+        name: docker
+        state: started
+        enabled: yes
+
+    # Install kubeadm, kubelet, and kubectl
+    - name: Add Kubernetes GPG key
+      ansible.builtin.apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+    - name: Add Kubernetes APT repository
+      ansible.builtin.apt_repository:
+        repo: "deb https://apt.kubernetes.io/ kubernetes-xenial main"
+        state: present
+        filename: kubernetes.list
+        update_cache: yes
+
+    - name: Install kubeadm, kubelet, and kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet={{ kubernetes_version }}
+          - kubeadm={{ kubernetes_version }}
+          - kubectl={{ kubernetes_version }}
+        state: present
+
+    - name: Hold the versions of kubeadm, kubelet, and kubectl
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+# ==============================================================================
+# --- Play 2: Initialize Kubernetes on the First Manager Node ---
+# ==============================================================================
+# This play initializes the cluster and prepares the join commands.
+- name: Initialize Kubernetes on the first manager node
+  hosts: manager[0]
+  become: yes
+  tasks:
+    - name: Initialize the Kubernetes cluster
+      ansible.builtin.shell:
+        cmd: |
+          kubeadm init --pod-network-cidr={{ pod_network_cidr }}
+      args:
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init_output
+
+    - name: Display kubeadm init output
+      ansible.builtin.debug:
+        var: kubeadm_init_output.stdout_lines
+
+    # Set up kubectl for the admin user on the manager node
+    - name: Create .kube directory for admin user
+      ansible.builtin.file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Copy admin.conf to the admin user's .kube directory
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+
+    # Generate a join command for worker nodes
+    - name: Get kubeadm join command for worker nodes
+      ansible.builtin.shell:
+        cmd: |
+          kubeadm token create --print-join-command
+      register: worker_join_command
+
+    - name: Display worker join command
+      ansible.builtin.debug:
+        msg: "Worker Join Command: {{ worker_join_command.stdout }}"
+
+    - name: Save worker join command to a local file
+      ansible.builtin.copy:
+        content: "{{ worker_join_command.stdout }}"
+        dest: "./worker_join_command.sh"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+
+    # Install a Container Network Interface (CNI), e.g., Calico
+    - name: Install Calico CNI
+      ansible.builtin.shell:
+        cmd: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+      args:
+        creates: /etc/cni/net.d/10-calico.conflist
+
+# ==============================================================================
+# --- Play 3: Join Worker Nodes to the Cluster ---
+# ==============================================================================
+# This play uses the join command generated in the previous step.
+- name: Join worker nodes to the cluster
+  hosts: worker
+  become: yes
+  tasks:
+    - name: Wait for the join command file to be created
+      ansible.builtin.wait_for:
+        path: "./worker_join_command.sh"
+        state: present
+        timeout: 60
+      delegate_to: localhost
+      run_once: true
+
+    - name: Fetch worker join command from local file
+      ansible.builtin.slurp:
+        src: "./worker_join_command.sh"
+      register: worker_join_slurp_output
+      delegate_to: localhost
+      run_once: true
+
+    - name: Decode and set worker join command fact
+      ansible.builtin.set_fact:
+        worker_join_command_fact: "{{ worker_join_slurp_output['content'] | b64decode }}"
+
+    - name: Join the worker node to the cluster
+      ansible.builtin.shell:
+        cmd: "{{ worker_join_command_fact }}"
+      args:
+        creates: /var/lib/kubelet/config.yaml
+
+# ==============================================================================
+# --- Play 4: Configure the Dedicated Admin Node for kubectl access ---
+# ==============================================================================
+# This play copies the kubeconfig file to the admin node for remote management.
+- name: Configure the dedicated admin node
+  hosts: admin
+  become: yes
+  tasks:
+    - name: Create .kube directory on admin node
+      ansible.builtin.file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Fetch kubeconfig file from the first manager node
+      ansible.builtin.fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "./fetched_configs/{{ inventory_hostname }}/"
+        flat: yes
+      delegate_to: "{{ hostvars[groups['manager'][0]]['inventory_hostname'] }}"
+      run_once: true
+
+    - name: Copy kubeconfig to the admin node's .kube directory
+      ansible.builtin.copy:
+        src: "./fetched_configs/{{ hostvars[groups['manager'][0]]['inventory_hostname'] }}/etc/kubernetes/admin.conf"
+        dest: /home/{{ ansible_user }}/.kube/config
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+
