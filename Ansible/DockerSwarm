@@ -1,0 +1,119 @@
+---
+# playbook.yml
+# This Ansible playbook installs Docker and sets up a Docker Swarm cluster
+# with a designated manager and worker nodes.
+
+# Ensure to have your inventory file (e.g., `hosts.ini`) set up correctly
+# with a [manager_nodes] and [worker_nodes] group.
+
+#
+# -----------------------------------------------------------------------------
+# Play 1: Common setup - Install Docker on all nodes
+# -----------------------------------------------------------------------------
+- name: "COMMON | Install Docker CE on all nodes"
+  hosts: all
+  become: yes # Use sudo for privileged tasks
+
+  tasks:
+    - name: "Install required system packages"
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - software-properties-common
+        state: present
+        update_cache: yes
+
+    - name: "Add Docker's official GPG key"
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: "Add Docker repository"
+      ansible.builtin.apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+
+    - name: "Install Docker CE"
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+
+    - name: "Ensure docker service is running and enabled"
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: "Add the current user to the 'docker' group"
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+      # To use this without relogging, you might need to run `newgrp docker`
+      # or simply log out and back in on your nodes.
+
+#
+# -----------------------------------------------------------------------------
+# Play 2: Manager setup - Initialize Docker Swarm and get join token
+# -----------------------------------------------------------------------------
+- name: "MANAGER | Initialize Docker Swarm and get join token"
+  hosts: manager_nodes
+  become: yes
+  # Run this entire play on only one manager node. This is a best practice to
+  # avoid multiple managers initializing the swarm.
+  run_once: true
+
+  tasks:
+    - name: "Check if swarm is already active"
+      ansible.builtin.shell: "docker info | grep 'Swarm: active'"
+      register: swarm_status
+      ignore_errors: yes
+      # This task checks if the swarm has already been initialized.
+      # The `ignore_errors` allows the play to continue if the grep fails (no swarm found).
+
+    - name: "Initialize Docker Swarm"
+      ansible.builtin.shell: "docker swarm init --advertise-addr {{ ansible_host }}"
+      when: swarm_status.rc != 0
+      # Only run this task if the swarm_status check failed, meaning no swarm is active.
+      # The `--advertise-addr` specifies the IP address to be used for inter-node communication.
+
+    - name: "Retrieve the worker join token"
+      ansible.builtin.shell: "docker swarm join-token worker -q"
+      register: worker_token_result
+      # This task gets the worker join token from the manager.
+      # The `-q` flag ensures we only get the token value, without any extra text.
+
+    - name: "Set a fact for the worker join token"
+      ansible.builtin.set_fact:
+        worker_join_token: "{{ worker_token_result.stdout }}"
+      # We set a fact so the worker token is available to the next play.
+      # This is how we pass variables between different plays in a playbook.
+
+
+#
+# -----------------------------------------------------------------------------
+# Play 3: Worker setup - Join the Docker Swarm
+# -----------------------------------------------------------------------------
+- name: "WORKER | Join the Docker Swarm"
+  hosts: worker_nodes
+  become: yes
+
+  tasks:
+    - name: "Check if swarm is already active"
+      ansible.builtin.shell: "docker info | grep 'Swarm: active'"
+      register: swarm_status
+      ignore_errors: yes
+
+    - name: "Join the Swarm as a worker"
+      ansible.builtin.shell: "docker swarm join --token {{ hostvars[groups['manager_nodes'][0]]['worker_join_token'] }} {{ groups['manager_nodes'][0] }}:2377"
+      when: swarm_status.rc != 0
+      # This task joins the worker to the swarm.
+      # The `hostvars` magic variable is used to get the worker_join_token fact
+      # from the first host in the `manager_nodes` group.
+      # We also reference the IP address of the first manager node to connect to the swarm.
